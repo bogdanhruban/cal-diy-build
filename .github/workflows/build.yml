@@ -136,7 +136,7 @@ jobs:
         run: |
           docker run --rm --entrypoint bash "$TAG" -c '
             set -euo pipefail; cd /calcom; node -v
-            n() { grep -rlE "$1" apps/web/.next apps/web/public 2>/dev/null | wc -l; }
+            n() { { grep -rlE "$1" apps/web/.next apps/web/public 2>/dev/null || true; } | wc -l; }  # 0 matches must not trip pipefail
             echo "env NEXT_PUBLIC_WEBAPP_URL=$NEXT_PUBLIC_WEBAPP_URL"
             p=$(n "http://NEXT_PUBLIC_WEBAPP_URL_PLACEHOLDER"); echo "WEBAPP_URL placeholder files: $p"; [ "$p" -gt 0 ]
             r=$(n "__CALDIY_RT_[A-Z_]+__"); echo "runtime placeholder files: $r"; [ "$r" -gt 0 ]
@@ -169,9 +169,9 @@ jobs:
           wait_up
           docker exec smoke bash -c '
             set -euo pipefail; cd /calcom
-            n() { grep -rlE "$1" apps/web/.next apps/web/public 2>/dev/null | wc -l; }
+            n() { { grep -rlE "$1" apps/web/.next apps/web/public 2>/dev/null || true; } | wc -l; }  # 0 matches must not trip pipefail
             left=$(n "__CALDIY_RT_[A-Z_]+__|http://NEXT_PUBLIC_WEBAPP_URL_PLACEHOLDER"); echo "placeholders left: $left"; [ "$left" -eq 0 ]
-            u=$(grep -rl "cal.example.test" apps/web/.next/static 2>/dev/null | wc -l); echo "runtime URL in client bundle: $u files"; [ "$u" -gt 0 ]
+            u=$({ grep -rl "cal.example.test" apps/web/.next/static 2>/dev/null || true; } | wc -l); echo "runtime URL in client bundle: $u files"; [ "$u" -gt 0 ]
             a=$(n "Smoke Test Booking"); echo "runtime APP_NAME: $a files"; [ "$a" -gt 0 ]
           '
           echo "GET /api/version: $(curl -s http://127.0.0.1:3000/api/version)"
