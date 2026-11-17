@@ -1,0 +1,50 @@
+# Minimal example: Cal.diy behind a reverse proxy on the same Docker network.
+# Secrets come from an .env file next to this file (see README, "Runtime configuration").
+services:
+  calcom:
+    image: ghcr.io/OWNER/cal-diy:SHA10-nosignup-rN@sha256:DIGEST   # pin tag@digest
+    restart: unless-stopped
+    depends_on:
+      db: { condition: service_healthy }
+    environment:
+      NEXT_PUBLIC_WEBAPP_URL: https://cal.example.com
+      NEXT_PUBLIC_APP_NAME: Example Bookings
+      ALLOWED_HOSTNAMES: '"cal.example.com"'
+      TZ: Europe/Berlin
+      NODE_OPTIONS: --max-old-space-size=640
+      NEXTAUTH_SECRET: ${NEXTAUTH_SECRET:?}
+      CALENDSO_ENCRYPTION_KEY: ${CALENDSO_ENCRYPTION_KEY:?}
+      DATABASE_HOST: db:5432
+      DATABASE_URL: postgresql://calcom:${DB_PASSWORD:?}@db:5432/calcom?connection_limit=5
+      DATABASE_DIRECT_URL: postgresql://calcom:${DB_PASSWORD:?}@db:5432/calcom
+      EMAIL_FROM: bookings@example.com
+      EMAIL_FROM_NAME: Example
+      EMAIL_SERVER_HOST: ${SMTP_HOST:?}
+      EMAIL_SERVER_PORT: ${SMTP_PORT:-587}
+      EMAIL_SERVER_USER: ${SMTP_USER:?}
+      EMAIL_SERVER_PASSWORD: ${SMTP_PASSWORD:?}
+      GOOGLE_API_CREDENTIALS: ${GOOGLE_API_CREDENTIALS:-}
+    mem_limit: 1g
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q --spider http://127.0.0.1:3000/api/version || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 180s
+    # no `ports:` — only the reverse proxy on this network reaches it
+
+  db:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: calcom
+      POSTGRES_PASSWORD: ${DB_PASSWORD:?}
+      POSTGRES_DB: calcom
+    volumes: [db:/var/lib/postgresql/data]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U calcom"]
+      interval: 5s
+      retries: 30
+
+volumes:
+  db:

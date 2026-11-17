@@ -1,0 +1,12 @@
+# Thin layer on top of the image built from the unmodified upstream Dockerfile.
+# BASE is passed by the workflow (local tag of the upstream build).
+ARG BASE
+FROM ${BASE}
+
+# The build-time .env.production carries placeholders only; Next.js would also load it at runtime and
+# feed placeholders to code that reads process.env dynamically. Values come from the container env.
+RUN find /calcom/apps/web -name .env.production -not -path '*/node_modules/*' -delete
+
+COPY --chmod=0755 runtime-env.sh /calcom/scripts/runtime-env.sh
+
+CMD ["/calcom/scripts/runtime-env.sh"]
