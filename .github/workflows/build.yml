@@ -23,6 +23,10 @@ on:
         description: "Push the image after the smoke test passes"
         type: boolean
         default: true
+      apply_patches:
+        description: "Apply patches/*.patch (minimal upstream bug fixes) to the upstream source"
+        type: boolean
+        default: true
 
 permissions:
   contents: read
@@ -55,6 +59,7 @@ jobs:
           UPSTREAM: ${{ inputs.upstream }}
           FLAVOR: ${{ inputs.flavor }}
           IMAGE_IN: ${{ inputs.image }}
+          PATCHES: ${{ inputs.apply_patches }}
           OWNER: ${{ github.repository_owner }}
           RUN_NO: ${{ github.run_number }}
         run: |
@@ -63,7 +68,8 @@ jobs:
           image="${IMAGE_IN:-ghcr.io/${OWNER,,}/cal-diy}"
           [[ "$image" =~ ^[a-z0-9./_-]+$ ]] || { echo "::error::invalid image name: $image"; exit 1; }
           echo "image=$image" >> "$GITHUB_OUTPUT"
-          echo "tag=$image:${REF:0:10}-$FLAVOR-r$RUN_NO" >> "$GITHUB_OUTPUT"
+          suffix=""; [ "$PATCHES" = true ] && suffix="-p"
+          echo "tag=$image:${REF:0:10}-$FLAVOR$suffix-r$RUN_NO" >> "$GITHUB_OUTPUT"
 
       - name: Free disk space
         run: |
@@ -82,6 +88,29 @@ jobs:
           ref: ${{ inputs.ref }}
           path: src
           persist-credentials: false
+
+      - name: Apply patches
+        id: patches
+        env:
+          APPLY: ${{ inputs.apply_patches }}
+        run: |
+          set -euo pipefail
+          applied=""
+          if [ "$APPLY" = true ]; then
+            shopt -s nullglob
+            for p in patches/*.patch; do
+              echo "::group::$p"
+              git -C src apply --verbose "$GITHUB_WORKSPACE/$p" || { echo "::error::patch does not apply: $p"; exit 1; }
+              echo "::endgroup::"
+              applied="${applied:+$applied,}$(basename "$p" .patch)"
+            done
+          fi
+          echo "applied=${applied:-none}" >> "$GITHUB_OUTPUT"
+          git -C src status --short
+          {
+            echo "### Patches"; echo
+            if [ -n "$applied" ]; then echo "$applied" | tr ',' '\n' | sed 's/^/- `/; s/$/`/'; else echo "none"; fi
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Build-time placeholders (Next.js reads apps/web/.env.production during next build)
         env:
@@ -118,16 +147,18 @@ jobs:
           REF: ${{ inputs.ref }}
           UPSTREAM: ${{ inputs.upstream }}
           FLAVOR: ${{ inputs.flavor }}
+          PATCHES: ${{ steps.patches.outputs.applied }}
           SRC: ${{ github.server_url }}/${{ github.repository }}
         run: |
           docker build -f Dockerfile.runtime --build-arg BASE=cal-diy-base:local \
             --label org.opencontainers.image.source="$SRC" \
             --label org.opencontainers.image.revision="$REF" \
             --label org.opencontainers.image.title="cal-diy" \
-            --label org.opencontainers.image.description="Cal.diy ($UPSTREAM@$REF, flavor $FLAVOR) with runtime-configurable URL" \
+            --label org.opencontainers.image.description="Cal.diy ($UPSTREAM@$REF, flavor $FLAVOR, patches $PATCHES) with runtime-configurable URL" \
             --label org.opencontainers.image.licenses=MIT \
             --label io.github.cal-diy-build.upstream="$UPSTREAM" \
             --label io.github.cal-diy-build.flavor="$FLAVOR" \
+            --label io.github.cal-diy-build.patches="$PATCHES" \
             -t "$TAG" .
 
       - name: Static checks

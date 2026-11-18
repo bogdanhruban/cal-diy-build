@@ -30,7 +30,7 @@ Read their README before relying on it.
 
 ## Image
 
-`ghcr.io/<owner>/cal-diy:<upstream-sha10>-<flavor>-r<run>`. The digest is printed in the run summary.
+`ghcr.io/<owner>/cal-diy:<upstream-sha10>-<flavor>[-p]-r<run>` (`-p` = [patches](#patches) applied). The digest is printed in the run summary.
 Pin `tag@sha256:…` in production, and don't use a moving tag.
 
 | Flavor | Meaning |
@@ -45,6 +45,20 @@ container to close sign-up. The flavor only changes what the UI shows.
 
 Both flavors have telemetry disabled (`CALCOM_TELEMETRY_DISABLED=1`) and `NEXT_PUBLIC_LICENSE_CONSENT=agree`.
 Platform: `linux/amd64`.
+
+## Patches
+
+By default the build applies the files in [`patches/`](patches/) to the upstream checkout, in order, with
+`git apply` (the build fails if one does not apply). They are minimal bug fixes, each meant to be sent
+upstream and dropped once upstream has it. Nothing else in the source is changed.
+
+| Patch | Fixes |
+|---|---|
+| `0001-calendars-filter-selected-calendars-by-credential` | With two connected accounts of the same calendar type (e.g. two Google or two Zoho accounts), each credential was asked for the other account's selected calendars, because they were filtered by integration type only. Busy times stayed correct, but logs filled with errors (`CALENDAR_NOTFOUND`, "error getting events", "getAvailabilityWithTitles failed"). Now a selected calendar that records its `credentialId` goes only to that credential; legacy rows without one are kept. CalDAV matching is unchanged. |
+| `0002-zohocalendar-empty-freebusy` | Zoho returns no `freebusy` key when nothing is busy; the code threw a `TypeError` and dropped availability for that whole Zoho credential. Missing `freebusy` is now treated as empty. |
+
+The applied patches are listed in the image label `io.github.cal-diy-build.patches` and in the run
+summary. To build plain upstream, run the workflow with `apply_patches` = `false` (the tag then has no `-p`).
 
 ## Runtime configuration
 
@@ -118,6 +132,7 @@ Actions → **build** → Run workflow:
 | `flavor` | `nosignup` or `signup` |
 | `image` | empty = `ghcr.io/<owner>/cal-diy` |
 | `push` | push after the smoke test passes |
+| `apply_patches` | default `true`; apply [`patches/`](#patches) |
 
 Pick a commit whose upstream CI is green. The build needs a standard GitHub-hosted runner for public
 repositories (4 vCPU / 16 GB). It takes about 15–20 minutes.

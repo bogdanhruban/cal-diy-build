@@ -1,0 +1,13 @@
+--- a/packages/app-store/zohocalendar/lib/CalendarService.ts
++++ b/packages/app-store/zohocalendar/lib/CalendarService.ts
+@@ -261,8 +261,9 @@
+ 
+     if (data.fb_not_enabled || data.NODATA) return [];
+ 
++    // Zoho returns an object without `freebusy` when nothing is busy in the range.
+     return (
+-      data.freebusy
++      (data.freebusy ?? [])
+         .filter((freebusy: FreeBusy) => freebusy.fbtype === "busy")
+         .map((freebusy: FreeBusy) => ({
+           // using dayjs utc plugin because by default, dayjs parses and displays in local time, which causes a mismatch
