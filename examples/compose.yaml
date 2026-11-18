@@ -9,6 +9,7 @@ services:
     environment:
       NEXT_PUBLIC_WEBAPP_URL: https://cal.example.com
       NEXT_PUBLIC_APP_NAME: Example Bookings
+      NEXT_PUBLIC_DISABLE_SIGNUP: "true"
       ALLOWED_HOSTNAMES: '"cal.example.com"'
       TZ: Europe/Berlin
       NODE_OPTIONS: --max-old-space-size=640

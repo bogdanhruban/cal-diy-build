@@ -35,8 +35,13 @@ Pin `tag@sha256:…` in production, and don't use a moving tag.
 
 | Flavor | Meaning |
 |---|---|
-| `nosignup` | `NEXT_PUBLIC_DISABLE_SIGNUP=true` is baked in. It cannot be a runtime option, because Next.js inlines the value and the minifier removes the code path. |
-| `signup` | Upstream default: public sign-up is possible. |
+| `nosignup` | `NEXT_PUBLIC_DISABLE_SIGNUP=true` baked into the client bundle (UI hides sign-up). |
+| `signup` | Upstream default. |
+
+**Sign-up is enforced server-side at runtime.** The `/signup` page and `POST /api/auth/signup` read
+`NEXT_PUBLIC_DISABLE_SIGNUP` from the container environment, and also honour the global `disable-signup`
+feature flag in the database. So whichever flavor you use, set `NEXT_PUBLIC_DISABLE_SIGNUP=true` on the
+container to close sign-up. The flavor only changes what the UI shows.
 
 Both flavors have telemetry disabled (`CALCOM_TELEMETRY_DISABLED=1`) and `NEXT_PUBLIC_LICENSE_CONSENT=agree`.
 Platform: `linux/amd64`.
@@ -69,6 +74,7 @@ you built. The usual set:
 | `EMAIL_FROM`, `EMAIL_FROM_NAME`, `EMAIL_SERVER_HOST`, `EMAIL_SERVER_PORT`, `EMAIL_SERVER_USER`, `EMAIL_SERVER_PASSWORD` | SMTP |
 | `GOOGLE_API_CREDENTIALS` | Google OAuth client JSON. The upstream seed writes it to the database on **every** start, so the env wins over the admin UI. |
 | `ALLOWED_HOSTNAMES` | e.g. `'"cal.example.com"'` |
+| `NEXT_PUBLIC_DISABLE_SIGNUP` | `true` closes public sign-up (server-side check, read at runtime) |
 | `TZ` | Container timezone |
 
 **Do not set `NEXT_PUBLIC_WEBSITE_URL`** unless you run the Cal.com marketing site. Upstream builds booking
@@ -87,8 +93,8 @@ See [`examples/compose.yaml`](examples/compose.yaml) and [`examples/nginx.conf`]
 - **Embedding:** the app sends `X-Frame-Options: DENY` only on `/auth/*` and `/signup`. If your proxy adds a
   global `X-Frame-Options`, booking pages cannot be iframed. Allow embedding with
   `Content-Security-Policy: frame-ancestors 'self' https://your-site.example`.
-- **Sign-up:** with the `nosignup` flavor, also return 404 for `/signup` and `/api/auth/signup` at the
-  proxy, as defence in depth.
+- **Sign-up:** besides `NEXT_PUBLIC_DISABLE_SIGNUP=true`, you can return 404 for `/signup` and
+  `/api/auth/signup` at the proxy, as defence in depth.
 
 ## Building
 

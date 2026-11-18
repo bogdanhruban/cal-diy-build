@@ -157,6 +157,7 @@ jobs:
             -e DATABASE_URL=postgresql://calcom:calcom@localhost:5432/calcom \
             -e DATABASE_DIRECT_URL=postgresql://calcom:calcom@localhost:5432/calcom \
             -e CALCOM_TELEMETRY_DISABLED=1 \
+            -e NEXT_PUBLIC_DISABLE_SIGNUP=true \
             "$TAG"
           wait_up() {
             for i in $(seq 1 90); do
@@ -176,7 +177,8 @@ jobs:
           '
           echo "GET /api/version: $(curl -s http://127.0.0.1:3000/api/version)"
           echo "GET /auth/login: $(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:3000/auth/login) (info)"
-          echo "GET /signup: $(curl -s -o /dev/null -w '%{http_code} -> %{redirect_url}' http://127.0.0.1:3000/signup) (info)"
+          sp=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:3000/signup); echo "GET /signup (sign-up disabled at runtime): $sp"; [ "$sp" = 307 ]
+          sa=$(curl -s -o /dev/null -w '%{http_code}' -X POST -H 'Content-Type: application/json' -d '{"email":"a@example.test","username":"a","password":"Aa1aaaaaaaaaaaaaaa"}' http://127.0.0.1:3000/api/auth/signup); echo "POST /api/auth/signup: $sa"; [ "$sa" = 403 ]
           docker restart smoke >/dev/null && wait_up
           docker logs smoke 2>&1 | grep -E "runtime-env:" || true
           docker stats --no-stream --format 'memory after start: {{.MemUsage}}' smoke
