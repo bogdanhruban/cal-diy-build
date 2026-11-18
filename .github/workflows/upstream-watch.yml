@@ -1,0 +1,356 @@
+name: upstream-watch
+
+# Weekly: pick the newest upstream commit with green CI, build and smoke-test it with build.yml, and
+# publish a GitHub Release with an upgrade report and a machine-readable release.json.
+# See "Automated updates" in README.md.
+
+on:
+  schedule:
+    - cron: "0 1 * * 1" # Mondays 01:00 UTC
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "Build and release even if the candidate is the commit of the latest release"
+        type: boolean
+        default: false
+      ref:
+        description: "Upstream commit SHA to build instead of the newest green commit (optional)"
+        required: false
+        default: ""
+
+permissions: {}
+
+concurrency:
+  group: upstream-watch
+  cancel-in-progress: false
+
+env:
+  # Override with repository variables (Settings -> Secrets and variables -> Actions -> Variables).
+  UPSTREAM_REPO: ${{ vars.UPSTREAM_REPO || 'calcom/cal.diy' }}
+  UPSTREAM_BRANCH: ${{ vars.UPSTREAM_BRANCH || 'main' }}
+  FLAVOR: nosignup
+  # How far back to look for a commit whose check runs all passed.
+  MAX_WALK: 20
+
+jobs:
+  resolve:
+    name: Resolve candidate
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    outputs:
+      upstream: ${{ steps.cfg.outputs.upstream }}
+      flavor: ${{ steps.cfg.outputs.flavor }}
+      candidate: ${{ steps.candidate.outputs.sha }}
+      previous: ${{ steps.previous.outputs.ref }}
+      build: ${{ steps.decide.outputs.build }}
+      report: ${{ steps.report.outputs.report }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - name: Configuration
+        id: cfg
+        run: |
+          [[ "$UPSTREAM_REPO" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || { echo "::error::UPSTREAM_REPO must be owner/repo"; exit 1; }
+          echo "upstream=$UPSTREAM_REPO" >> "$GITHUB_OUTPUT"
+          echo "flavor=$FLAVOR" >> "$GITHUB_OUTPUT"
+
+      - name: Previous release
+        id: previous
+        run: |
+          set -euo pipefail
+          tag=$(gh release view --json tagName --jq .tagName 2>/dev/null || true)
+          ref=""
+          if [ -n "$tag" ]; then
+            ref=$(gh release download "$tag" -p release.json -O - | jq -r '.ref // empty')
+            [[ "$ref" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::latest release $tag has no valid release.json ref"; exit 1; }
+            echo "Latest release: $tag (upstream $ref)"
+          else
+            echo "No release yet."
+          fi
+          echo "ref=$ref" >> "$GITHUB_OUTPUT"
+
+      - name: Candidate (newest commit with green checks)
+        id: candidate
+        env:
+          REF_IN: ${{ inputs.ref }}
+        run: |
+          set -euo pipefail
+          if [ -n "${REF_IN:-}" ]; then
+            [[ "$REF_IN" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::ref must be a full 40-character commit SHA"; exit 1; }
+            gh api "repos/$UPSTREAM_REPO/commits/$REF_IN" --jq .sha >/dev/null
+            echo "Using the ref given as input (check runs not evaluated): $REF_IN"
+            echo "sha=$REF_IN" >> "$GITHUB_OUTPUT"
+            echo "source=input" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          for sha in $(gh api "repos/$UPSTREAM_REPO/commits?sha=$UPSTREAM_BRANCH&per_page=$MAX_WALK" --jq '.[].sha'); do
+            runs=$(gh api --paginate "repos/$UPSTREAM_REPO/commits/$sha/check-runs?per_page=100" \
+              --jq '.check_runs[] | [.status, (.conclusion // "none"), .name] | @tsv')
+            total=$(grep -c . <<<"$runs" || true)
+            bad=$(awk -F'\t' '$1 != "completed" || ($2 != "success" && $2 != "skipped" && $2 != "neutral")' <<<"$runs")
+            nbad=$(grep -c . <<<"$bad" || true)
+            if [ "$total" -gt 0 ] && [ "$nbad" -eq 0 ]; then
+              echo "Candidate: $sha ($total check runs, all success/skipped/neutral)"
+              echo "sha=$sha" >> "$GITHUB_OUTPUT"
+              echo "source=checks" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            echo "Skip $sha: $total check runs, $nbad not green"
+            head -5 <<<"$bad" | sed 's/^/    /'
+          done
+          echo "::error::none of the last $MAX_WALK commits on $UPSTREAM_REPO@$UPSTREAM_BRANCH has all check runs green"
+          exit 1
+
+      - name: Decide
+        id: decide
+        env:
+          CANDIDATE: ${{ steps.candidate.outputs.sha }}
+          PREVIOUS: ${{ steps.previous.outputs.ref }}
+          FORCE: ${{ inputs.force || false }}
+        run: |
+          if [ "$CANDIDATE" = "$PREVIOUS" ] && [ "$FORCE" != true ]; then
+            echo "build=false" >> "$GITHUB_OUTPUT"
+            { echo "### Up to date"; echo
+              echo "The latest release already contains \`$UPSTREAM_REPO@${CANDIDATE:0:10}\`. Nothing to build."; } >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "build=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Upgrade report
+        id: report
+        if: steps.decide.outputs.build == 'true'
+        env:
+          CANDIDATE: ${{ steps.candidate.outputs.sha }}
+          PREVIOUS: ${{ steps.previous.outputs.ref }}
+        run: |
+          set -euo pipefail
+          python3 .github/scripts/upstream_watch.py report \
+            --upstream "$UPSTREAM_REPO" --candidate "$CANDIDATE" --previous "$PREVIOUS" --out report.json
+          echo "report=$(jq -c . report.json)" >> "$GITHUB_OUTPUT"
+          jq -r '"### Upgrade report", "",
+            "- Upstream: `\(.upstream)@\(.candidate[0:10])` (previous: `\(.previous_ref // "none" | .[0:10])`)",
+            "- Commits: \(.commit_count) — \(.upstream_compare_url)",
+            "- Migrations added: \(.migrations_added | length)",
+            "- Example env vars: +\(.env_example.added | length) / -\(.env_example.removed | length)",
+            "- Build-sensitive files changed: \(if (.risky_files_changed | length) > 0 then (.risky_files_changed | join(", ")) else "none" end)"' \
+            report.json >> "$GITHUB_STEP_SUMMARY"
+
+  build:
+    name: Build
+    needs: resolve
+    if: needs.resolve.outputs.build == 'true'
+    permissions:
+      contents: read
+      packages: write
+    uses: ./.github/workflows/build.yml
+    with:
+      ref: ${{ needs.resolve.outputs.candidate }}
+      upstream: ${{ needs.resolve.outputs.upstream }}
+      flavor: ${{ needs.resolve.outputs.flavor }}
+      push: true
+      apply_patches: true
+
+  release:
+    name: Publish release
+    needs: [resolve, build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - name: Write release.json and notes
+        env:
+          REPORT: ${{ needs.resolve.outputs.report }}
+          IMAGE: ${{ needs.build.outputs.image }}
+          TAG: ${{ needs.build.outputs.tag }}
+          DIGEST: ${{ needs.build.outputs.digest }}
+          PATCHES: ${{ needs.build.outputs.patches_json }}
+          FLAVOR: ${{ needs.resolve.outputs.flavor }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          [[ "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "::error::build returned no digest"; exit 1; }
+          printf '%s' "$REPORT" > report.json
+          python3 .github/scripts/upstream_watch.py release --report report.json \
+            --image "$IMAGE" --tag "$TAG" --digest "$DIGEST" --flavor "$FLAVOR" --patches "$PATCHES" \
+            --run-url "$RUN_URL" --release-json release.json --notes notes.md
+          cat release.json
+          cat notes.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Create release
+        env:
+          TAG: ${{ needs.build.outputs.tag }}
+          REF: ${{ needs.resolve.outputs.candidate }}
+          FLAVOR: ${{ needs.resolve.outputs.flavor }}
+        run: |
+          set -euo pipefail
+          gh release create "$TAG" release.json \
+            --target "$GITHUB_SHA" \
+            --title "Cal.diy ${REF:0:10} ($FLAVOR)" \
+            --notes-file notes.md \
+            --latest
+          gh release view "$TAG" --json url --jq .url
+
+  drop-patches:
+    name: Drop upstreamed patches
+    needs: [resolve, build, release]
+    if: contains(needs.build.outputs.patches_json, '"upstreamed"')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      pull-requests: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Open pull request
+        env:
+          PATCHES: ${{ needs.build.outputs.patches_json }}
+          REF: ${{ needs.resolve.outputs.candidate }}
+          RELEASE_TAG: ${{ needs.build.outputs.tag }}
+          BASE: ${{ github.event.repository.default_branch }}
+        run: |
+          set -euo pipefail
+          branch="chore/drop-upstreamed-patches-${REF:0:10}"
+          mapfile -t names < <(jq -r '.[] | select(.status == "upstreamed") | .name' <<<"$PATCHES")
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git switch -c "$branch"
+          for n in "${names[@]}"; do
+            [ -f "patches/$n" ] || continue
+            git rm -q "patches/$n"
+            # Drop the patch's row from the README table.
+            sed -i "/^| \`${n%.patch}\` |/d" README.md
+          done
+          git add README.md
+          if git diff --cached --quiet; then echo "Nothing to remove (already dropped)."; exit 0; fi
+          list=$(printf -- '- `%s`\n' "${names[@]}")
+          git commit -q -F - <<EOF
+          Drop patches contained in upstream ${REF:0:10}
+
+          These patches apply in reverse to $UPSTREAM_REPO@$REF, so upstream already has the fix:
+          $list
+          EOF
+          git push -f origin "$branch"
+          body=$(cat <<EOF
+          The following patches are already contained in upstream \`$UPSTREAM_REPO@${REF:0:10}\` (they apply in reverse), so the build skipped them:
+
+          $list
+
+          This pull request removes them from \`patches/\` and drops their rows from the README table.
+          Built and released as [\`$RELEASE_TAG\`]($GITHUB_SERVER_URL/$GITHUB_REPOSITORY/releases/tag/$RELEASE_TAG) by [upstream-watch]($GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID).
+
+          Before merging, check that each fix landed upstream as intended (not just a textually identical hunk), and update any remaining README references.
+          EOF
+          )
+          existing=$(gh pr list --head "$branch" --state open --json number --jq '.[0].number // empty')
+          if [ -n "$existing" ]; then
+            gh pr edit "$existing" --body "$body"
+            echo "Updated pull request #$existing"
+          else
+            gh pr create --base "$BASE" --head "$branch" --title "Drop patches contained in upstream ${REF:0:10}" --body "$body"
+          fi
+
+  report-failure:
+    name: Report failure
+    needs: [resolve, build, release, drop-patches]
+    if: always() && contains(needs.*.result, 'failure')
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      actions: read
+      checks: read
+      issues: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - name: Open or update issue
+        env:
+          CANDIDATE: ${{ needs.resolve.outputs.candidate }}
+          PREVIOUS: ${{ needs.resolve.outputs.previous }}
+          PATCHES: ${{ needs.build.outputs.patches_json }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          label=upstream-watch
+          gh label create "$label" --color B60205 --description "Automated upstream build failures" 2>/dev/null || true
+          jobs=$(gh api --paginate "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/attempts/$GITHUB_RUN_ATTEMPT/jobs?per_page=100" \
+            --jq '.jobs[] | select(.conclusion == "failure")')
+          failed=$(jq -r '"- **\(.name)**: \([.steps[] | select(.conclusion == "failure") | .name] | join(", ") | if . == "" then "see log" else . end) ([log](\(.html_url)))"' <<<"$jobs")
+          errors=""
+          for id in $(jq -r '.id' <<<"$jobs"); do
+            errors+=$(gh api "repos/$GITHUB_REPOSITORY/check-runs/$id/annotations" \
+              --jq '.[] | select(.annotation_level == "failure") | "- \(.message | split("\n")[0])"' 2>/dev/null || true)$'\n'
+          done
+          patches=""
+          if [ -n "${PATCHES:-}" ] && [ "$PATCHES" != "[]" ]; then
+            patches=$(jq -r '"| Patch | Status |", "|---|---|", (.[] | "| `\(.name)` | \(.status) |")' <<<"$PATCHES")
+          fi
+          body=$(cat <<EOF
+          The scheduled upstream build failed. No release was published, so downstream consumers stay on the previous release.
+
+          | | |
+          |---|---|
+          | Run | $RUN_URL |
+          | Upstream | \`$UPSTREAM_REPO\` |
+          | Candidate | ${CANDIDATE:+\`$CANDIDATE\`} |
+          | Previous release ref | ${PREVIOUS:-none} |
+
+          ### Failed jobs
+          ${failed:-- (none recorded)}
+
+          ### Errors
+          ${errors:-- (no error annotations)}
+
+          ${patches:+### Patches}
+          ${patches}
+
+          Typical causes: a patch in \`patches/\` no longer applies (refresh or drop it), upstream changed the build so that \`runtime-env.sh\` no longer matches it, or the smoke test caught a regression. This issue is closed automatically by the next successful run.
+          EOF
+          )
+          number=$(gh issue list --label "$label" --state open --json number --jq '.[0].number // empty')
+          if [ -n "$number" ]; then
+            gh issue edit "$number" --body "$body"
+            gh issue comment "$number" --body "Failed again: $RUN_URL"
+          else
+            gh issue create --title "upstream-watch: automated build failed" --label "$label" --body "$body"
+          fi
+
+  close-issue:
+    name: Close failure issue
+    needs: [resolve, build, release, drop-patches]
+    if: always() && !contains(needs.*.result, 'failure') && !contains(needs.*.result, 'cancelled')
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      issues: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - name: Close open issue
+        env:
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          for n in $(gh issue list --label upstream-watch --state open --json number --jq '.[].number'); do
+            gh issue close "$n" --comment "Resolved: $RUN_URL succeeded."
+          done

@@ -49,8 +49,14 @@ Platform: `linux/amd64`.
 ## Patches
 
 By default the build applies the files in [`patches/`](patches/) to the upstream checkout, in order, with
-`git apply` (the build fails if one does not apply). They are minimal bug fixes, each meant to be sent
-upstream and dropped once upstream has it. Nothing else in the source is changed.
+`git apply`. They are minimal bug fixes, each meant to be sent upstream and dropped once upstream has it.
+Nothing else in the source is changed. Each patch ends up in one of three states:
+
+| Status | Meaning |
+|---|---|
+| `applied` | Applies cleanly; applied. |
+| `upstreamed` | Applies in reverse, so upstream already contains the fix; skipped (the build continues). |
+| `failed` | Applies neither way; the build fails after reporting every patch. Refresh or drop it. |
 
 | Patch | Fixes |
 |---|---|
@@ -58,7 +64,8 @@ upstream and dropped once upstream has it. Nothing else in the source is changed
 | `0002-zohocalendar-empty-freebusy` | Zoho returns no `freebusy` key when nothing is busy; the code threw a `TypeError` and dropped availability for that whole Zoho credential. Missing `freebusy` is now treated as empty. |
 
 The applied patches are listed in the image label `io.github.cal-diy-build.patches` and in the run
-summary. To build plain upstream, run the workflow with `apply_patches` = `false` (the tag then has no `-p`).
+summary. The tag carries `-p` only when at least one patch was applied. To build plain upstream, run the
+workflow with `apply_patches` = `false`.
 
 ## Runtime configuration
 
@@ -136,6 +143,88 @@ Actions → **build** → Run workflow:
 
 Pick a commit whose upstream CI is green. The build needs a standard GitHub-hosted runner for public
 repositories (4 vCPU / 16 GB). It takes about 15–20 minutes.
+
+`build.yml` is also a reusable workflow (`workflow_call`) with the same inputs. It returns `image`, `tag`,
+`digest`, `pinned` (`image:tag@digest`) and `patches_json` (`[{"name", "status"}]`).
+
+## Automated updates
+
+[`upstream-watch`](.github/workflows/upstream-watch.yml) runs every Monday at 01:00 UTC (and on demand from
+the Actions tab):
+
+1. **Candidate.** It walks back up to 20 commits on upstream `main` and takes the newest one whose check runs
+   are all `success`, `skipped` or `neutral`.
+2. **Up to date?** If the latest release of this repository was built from that commit, it stops. Run it
+   manually with `force` to rebuild anyway, or with `ref` to build a specific commit (check runs are then
+   not evaluated).
+3. **Upgrade report.** Between the previous release and the candidate: commit count and compare link,
+   commits grouped by [Conventional Commit](https://www.conventionalcommits.org/) type, new
+   `packages/prisma/migrations/` directories, variable names added to or removed from `.env.example` and
+   `.env.appStore.example`, and changes to build-sensitive files (`Dockerfile`, `scripts/start.sh`,
+   `scripts/replace-placeholder.sh`, `apps/web/next.config.ts`, `packages/prisma/schema.prisma`,
+   `packages/lib/constants.ts`). It also checks that the upstream build still provides what
+   `runtime-env.sh` relies on (the `NEXT_PUBLIC_WEBAPP_URL_PLACEHOLDER` URL in the `Dockerfile`, and
+   `BUILT_NEXT_PUBLIC_WEBAPP_URL` in `scripts/start.sh`), and fails if it does not.
+4. **Build.** It calls `build.yml` with flavor `nosignup`, patches on, push on. Nothing is published unless
+   the smoke test passes.
+5. **Release.** It publishes a GitHub Release tagged with the image tag, with the report as release notes
+   and a `release.json` asset.
+6. **Upstreamed patches.** If a patch was `upstreamed`, it opens a pull request
+   (`chore/drop-upstreamed-patches-<sha10>`) that deletes it and its README row.
+7. **Failures.** If anything fails (a patch conflict, the runtime check, the build or the smoke test), it
+   opens an issue labelled `upstream-watch`, or updates the open one, with the failed steps, the error
+   messages and the run link. The next successful run closes it. Downstream consumers stay on the previous
+   release in the meantime.
+
+Settings for forks:
+
+- The upstream repository and branch default to `calcom/cal.diy` and `main`; override them with the
+  repository variables `UPSTREAM_REPO` and `UPSTREAM_BRANCH`.
+- For step 6, enable *Settings → Actions → General → Allow GitHub Actions to create and approve pull
+  requests*. Pull requests opened with `GITHUB_TOKEN` do not trigger workflows.
+- Scheduled workflows are paused after 60 days without activity in the repository.
+
+### `release.json`
+
+Downstream automation (a deploy job, a bot, a dashboard) should read the `release.json` asset of the latest
+release rather than parse the notes:
+
+```sh
+gh release download -R <owner>/cal-diy-build -p release.json -O -          # latest release
+curl -fsSL https://github.com/<owner>/cal-diy-build/releases/latest/download/release.json
+```
+
+```json
+{
+  "schema": 1,
+  "image": "ghcr.io/<owner>/cal-diy",
+  "tag": "ae027bb70e-nosignup-p-r12",
+  "digest": "sha256:…",
+  "ref": "<upstream commit, 40 hex>",
+  "upstream": "calcom/cal.diy",
+  "flavor": "nosignup",
+  "previous_ref": "<40 hex, or null for the first release>",
+  "upstream_compare_url": "https://github.com/calcom/cal.diy/compare/…",
+  "commit_count": 42,
+  "smoke_test": "passed",
+  "patches": [{"name": "0001-….patch", "status": "applied"}],
+  "migrations_added": ["20261110000000_example"],
+  "env_example": {"added": [], "removed": []},
+  "risky_files_changed": ["packages/lib/constants.ts"],
+  "published_at": "2026-11-16T01:23:45Z"
+}
+```
+
+- Deploy `image:tag@digest`. Only releases whose image passed the smoke test are published, so
+  `smoke_test` is always `passed`.
+- `patches[].status` is `applied` or `upstreamed`; a `failed` patch fails the build, so no release has one.
+- `previous_ref` is the upstream commit of the release before this one; the diff fields (`commit_count`,
+  `migrations_added`, `env_example`, `risky_files_changed`) cover `previous_ref..ref`. When
+  `previous_ref` is `null` they are empty and `commit_count` is `0`.
+- A consumer that skips releases should merge the diff fields across every release it skipped, or compare
+  its own deployed `ref` with the new one.
+- Non-empty `migrations_added` means the database schema changes on first start: back up first.
+- `schema` changes only on incompatible changes; new fields may be added without a bump.
 
 ## Updating an instance
 
