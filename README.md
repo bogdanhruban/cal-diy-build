@@ -84,6 +84,17 @@ Port `3000`. Health: `GET /api/version`. First user: open `/auth/setup` (works o
 users; creates an ADMIN, and the password needs at least 15 characters with upper case, lower case and a
 digit). Create it before exposing the instance publicly.
 
+## CDN / browser caching (important)
+
+Next.js serves `/_next/static/*` as `public, max-age=31536000, immutable`, but this image rewrites the
+*content* of those files at container start without changing their names. After you change a runtime value
+(URL, app name, links), a CDN or browser that already cached a chunk keeps serving the old one for up to a
+year. So:
+
+- override the header at your reverse proxy, e.g. `Cache-Control: public, max-age=86400` for
+  `/_next/static/` (see `examples/nginx.conf`), and
+- purge your CDN cache for the instance hostname after changing runtime configuration.
+
 ## Example
 
 See [`examples/compose.yaml`](examples/compose.yaml) and [`examples/nginx.conf`](examples/nginx.conf).
