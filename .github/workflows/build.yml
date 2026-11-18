@@ -27,6 +27,48 @@ on:
         description: "Apply patches/*.patch (minimal upstream bug fixes) to the upstream source"
         type: boolean
         default: true
+  workflow_call:
+    inputs:
+      ref:
+        description: "Upstream commit SHA to build (full 40 characters)"
+        type: string
+        required: true
+      upstream:
+        description: "Upstream repository"
+        type: string
+        default: calcom/cal.diy
+      flavor:
+        description: "nosignup = public sign-up disabled at build time; signup = upstream default"
+        type: string
+        default: nosignup
+      image:
+        description: "Target image name (empty = ghcr.io/<owner>/cal-diy)"
+        type: string
+        default: ""
+      push:
+        description: "Push the image after the smoke test passes"
+        type: boolean
+        default: true
+      apply_patches:
+        description: "Apply patches/*.patch (minimal upstream bug fixes) to the upstream source"
+        type: boolean
+        default: true
+    outputs:
+      image:
+        description: "Image name without tag, e.g. ghcr.io/<owner>/cal-diy"
+        value: ${{ jobs.build.outputs.image }}
+      tag:
+        description: "Image tag, e.g. <sha10>-nosignup-p-r<run>"
+        value: ${{ jobs.build.outputs.tag }}
+      digest:
+        description: "Manifest digest (sha256:...); empty when push is false"
+        value: ${{ jobs.build.outputs.digest }}
+      pinned:
+        description: "image:tag@digest; empty when push is false"
+        value: ${{ jobs.build.outputs.pinned }}
+      patches_json:
+        description: 'JSON array of {"name": "<file>.patch", "status": "applied|upstreamed|failed"}'
+        value: ${{ jobs.build.outputs.patches_json }}
 
 permissions:
   contents: read
@@ -40,6 +82,12 @@ jobs:
   build:
     runs-on: ubuntu-latest
     timeout-minutes: 150
+    outputs:
+      image: ${{ steps.in.outputs.image }}
+      tag: ${{ steps.tag.outputs.tag }}
+      digest: ${{ steps.push.outputs.digest }}
+      pinned: ${{ steps.push.outputs.pinned }}
+      patches_json: ${{ steps.patches.outputs.json }}
     services:
       postgres:
         image: postgres:17-alpine
@@ -59,17 +107,14 @@ jobs:
           UPSTREAM: ${{ inputs.upstream }}
           FLAVOR: ${{ inputs.flavor }}
           IMAGE_IN: ${{ inputs.image }}
-          PATCHES: ${{ inputs.apply_patches }}
           OWNER: ${{ github.repository_owner }}
-          RUN_NO: ${{ github.run_number }}
         run: |
           [[ "$REF" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::ref must be a full 40-character commit SHA"; exit 1; }
           [[ "$UPSTREAM" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || { echo "::error::upstream must be owner/repo"; exit 1; }
+          [[ "$FLAVOR" =~ ^(nosignup|signup)$ ]] || { echo "::error::flavor must be nosignup or signup"; exit 1; }
           image="${IMAGE_IN:-ghcr.io/${OWNER,,}/cal-diy}"
           [[ "$image" =~ ^[a-z0-9./_-]+$ ]] || { echo "::error::invalid image name: $image"; exit 1; }
           echo "image=$image" >> "$GITHUB_OUTPUT"
-          suffix=""; [ "$PATCHES" = true ] && suffix="-p"
-          echo "tag=$image:${REF:0:10}-$FLAVOR$suffix-r$RUN_NO" >> "$GITHUB_OUTPUT"
 
       - name: Free disk space
         run: |
@@ -77,40 +122,76 @@ jobs:
           docker system prune -af >/dev/null
           df -h / ; free -h ; nproc
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           persist-credentials: false
 
       - name: Checkout upstream
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           repository: ${{ inputs.upstream }}
           ref: ${{ inputs.ref }}
           path: src
           persist-credentials: false
 
+      # Each patch is classified against the upstream checkout:
+      #   applied    - applies cleanly; applied.
+      #   upstreamed - applies in reverse, i.e. upstream already contains the change; skipped.
+      #   failed     - neither; the build fails after all patches have been classified.
       - name: Apply patches
         id: patches
         env:
           APPLY: ${{ inputs.apply_patches }}
         run: |
           set -euo pipefail
-          applied=""
+          results='[]'; applied=""; failed=0
           if [ "$APPLY" = true ]; then
             shopt -s nullglob
             for p in patches/*.patch; do
-              echo "::group::$p"
-              git -C src apply --verbose "$GITHUB_WORKSPACE/$p" || { echo "::error::patch does not apply: $p"; exit 1; }
+              name=$(basename "$p"); abs="$GITHUB_WORKSPACE/$p"
+              echo "::group::$name"
+              if git -C src apply --check "$abs" 2>/dev/null; then
+                git -C src apply --verbose "$abs"
+                status=applied; applied="${applied:+$applied,}${name%.patch}"
+              elif git -C src apply --reverse --check "$abs" 2>/dev/null; then
+                status=upstreamed
+                echo "::warning title=Patch upstreamed::$name is already contained in upstream; skipped. Remove it from patches/."
+              else
+                status=failed; failed=1
+                git -C src apply --check --verbose "$abs" || true
+                echo "::error title=Patch does not apply::$name applies neither forwards nor in reverse; refresh or drop it."
+              fi
               echo "::endgroup::"
-              applied="${applied:+$applied,}$(basename "$p" .patch)"
+              echo "$name: $status"
+              results=$(jq -c --arg n "$name" --arg s "$status" '. + [{name: $n, status: $s}]' <<<"$results")
             done
           fi
+          echo "json=$results" >> "$GITHUB_OUTPUT"
           echo "applied=${applied:-none}" >> "$GITHUB_OUTPUT"
           git -C src status --short
           {
             echo "### Patches"; echo
-            if [ -n "$applied" ]; then echo "$applied" | tr ',' '\n' | sed 's/^/- `/; s/$/`/'; else echo "none"; fi
+            if [ "$results" = '[]' ]; then echo "none"; else
+              echo "| Patch | Status |"; echo "|---|---|"
+              jq -r '.[] | "| `\(.name)` | \(.status) |"' <<<"$results"
+            fi
           } >> "$GITHUB_STEP_SUMMARY"
+          [ "$failed" -eq 0 ]
+
+      - name: Image tag
+        id: tag
+        env:
+          IMAGE: ${{ steps.in.outputs.image }}
+          REF: ${{ inputs.ref }}
+          FLAVOR: ${{ inputs.flavor }}
+          APPLIED: ${{ steps.patches.outputs.applied }}
+          RUN_NO: ${{ github.run_number }}
+        run: |
+          suffix=""; [ "$APPLIED" != none ] && suffix="-p"
+          tag="${REF:0:10}-$FLAVOR$suffix-r$RUN_NO"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "full=$IMAGE:$tag" >> "$GITHUB_OUTPUT"
+          echo "Image: $IMAGE:$tag"
 
       - name: Build-time placeholders (Next.js reads apps/web/.env.production during next build)
         env:
@@ -126,7 +207,7 @@ jobs:
           cat src/apps/web/.env.production
 
       - name: Build upstream Dockerfile (unmodified)
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
         with:
           context: src
           platforms: linux/amd64
@@ -143,7 +224,7 @@ jobs:
 
       - name: Add runtime layer
         env:
-          TAG: ${{ steps.in.outputs.tag }}
+          TAG: ${{ steps.tag.outputs.full }}
           REF: ${{ inputs.ref }}
           UPSTREAM: ${{ inputs.upstream }}
           FLAVOR: ${{ inputs.flavor }}
@@ -163,7 +244,7 @@ jobs:
 
       - name: Static checks
         env:
-          TAG: ${{ steps.in.outputs.tag }}
+          TAG: ${{ steps.tag.outputs.full }}
         run: |
           docker run --rm --entrypoint bash "$TAG" -c '
             set -euo pipefail; cd /calcom; node -v
@@ -176,7 +257,7 @@ jobs:
 
       - name: Smoke test (runtime substitution, migrations, restart)
         env:
-          TAG: ${{ steps.in.outputs.tag }}
+          TAG: ${{ steps.tag.outputs.full }}
         run: |
           set -euo pipefail
           docker run -d --name smoke --network host \
@@ -220,18 +301,21 @@ jobs:
 
       - name: Log in to GHCR
         if: inputs.push
-        uses: docker/login-action@v3
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Push image
+        id: push
         if: inputs.push
         env:
-          TAG: ${{ steps.in.outputs.tag }}
+          TAG: ${{ steps.tag.outputs.full }}
         run: |
           docker push "$TAG"
           digest=$(docker inspect --format '{{index .RepoDigests 0}}' "$TAG" | cut -d@ -f2)
           echo "Pin: $TAG@$digest"
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+          echo "pinned=$TAG@$digest" >> "$GITHUB_OUTPUT"
           { echo "### Image"; echo; echo "\`$TAG@$digest\`"; } >> "$GITHUB_STEP_SUMMARY"
