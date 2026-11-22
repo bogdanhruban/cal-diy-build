@@ -19,7 +19,9 @@ Read their README before relying on it.
 2. A thin layer (`Dockerfile.runtime`) adds `runtime-env.sh` as the container command.
 3. On first start, `runtime-env.sh` replaces the placeholders in the built output with values from the
    container environment, or with upstream defaults, refuses to start if any are left, then runs upstream
-   `scripts/start.sh` (`prisma migrate deploy`, app-store seed, `yarn start`).
+   `scripts/start.sh` (`prisma migrate deploy`, app-store seed), whose final `yarn start` the layer swaps for
+   `start-web.sh`: the same `next start` in the same directory and environment, exec'd directly instead of
+   through yarn -> turbo -> yarn (five idle wrapper processes, ~275 MiB). next-server runs as PID 1.
 4. CI runs a **smoke test** before pushing: it starts the image against a throw-away Postgres with
    `NEXT_PUBLIC_WEBAPP_URL=https://cal.example.test` and checks that:
    - migrations run;

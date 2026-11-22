@@ -8,5 +8,14 @@ FROM ${BASE}
 RUN find /calcom/apps/web -name .env.production -not -path '*/node_modules/*' -delete
 
 COPY --chmod=0755 runtime-env.sh /calcom/scripts/runtime-env.sh
+COPY --chmod=0755 start-web.sh /calcom/scripts/start-web.sh
+
+# Upstream start.sh ends with `yarn start` (yarn -> turbo -> yarn -> next start). Swap that one line for
+# start-web.sh, which execs `next start` directly; migrations and the app-store seed stay upstream's.
+# Fails the build if upstream changed the line, so the swap is never silently skipped.
+RUN test "$(grep -cx 'yarn start' /calcom/scripts/start.sh)" -eq 1 \
+ && test -x /calcom/node_modules/next/dist/bin/next \
+ && sed -i 's|^yarn start$|exec /calcom/scripts/start-web.sh|' /calcom/scripts/start.sh \
+ && test "$(grep -cx 'exec /calcom/scripts/start-web.sh' /calcom/scripts/start.sh)" -eq 1
 
 CMD ["/calcom/scripts/runtime-env.sh"]

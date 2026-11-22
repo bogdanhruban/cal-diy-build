@@ -287,6 +287,14 @@ jobs:
             u=$({ grep -rl "cal.example.test" apps/web/.next/static 2>/dev/null || true; } | wc -l); echo "runtime URL in client bundle: $u files"; [ "$u" -gt 0 ]
             a=$(n "Smoke Test Booking"); echo "runtime APP_NAME: $a files"; [ "$a" -gt 0 ]
           '
+          # start-web.sh: next-server is PID 1 and no yarn/turbo wrapper is left running.
+          docker exec smoke bash -c '
+            set -euo pipefail
+            p1=$(tr "\0" " " </proc/1/cmdline); echo "PID 1: $p1"; [[ $p1 == next-server* ]]
+            w=$(for p in /proc/[0-9]*; do tr "\0" " " <"$p/cmdline" 2>/dev/null; echo; done | grep -cE "yarn|turbo" || true)
+            echo "yarn/turbo processes: $w"; [ "$w" -eq 0 ]
+            ps -eo pid,rss,args
+          '
           echo "GET /api/version: $(curl -s http://127.0.0.1:3000/api/version)"
           echo "GET /auth/login: $(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:3000/auth/login) (info)"
           sp=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:3000/signup); echo "GET /signup (sign-up disabled at runtime): $sp"; [ "$sp" = 307 ]
