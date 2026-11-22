@@ -291,9 +291,10 @@ jobs:
           docker exec smoke bash -c '
             set -euo pipefail
             p1=$(tr "\0" " " </proc/1/cmdline); echo "PID 1: $p1"; [[ $p1 == next-server* ]]
-            w=$(for p in /proc/[0-9]*; do tr "\0" " " <"$p/cmdline" 2>/dev/null; echo; done | grep -cE "yarn|turbo" || true)
-            echo "yarn/turbo processes: $w"; [ "$w" -eq 0 ]
             ps -eo pid,rss,args
+            # [x] brackets: the pattern must not match this bash -c command line itself.
+            w=$(for p in /proc/[0-9]*; do tr "\0" " " <"$p/cmdline" 2>/dev/null; echo; done | grep -cE "yar[n]\.js|yar[n]-[0-9.]+\.cjs|tur[b]o run" || true)
+            echo "yarn/turbo processes: $w"; [ "$w" -eq 0 ]
           '
           echo "GET /api/version: $(curl -s http://127.0.0.1:3000/api/version)"
           echo "GET /auth/login: $(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:3000/auth/login) (info)"
